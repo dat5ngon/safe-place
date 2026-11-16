@@ -21,7 +21,7 @@ app.js       -- Google auth, Drive API, SafePlaceStorage class, UI logic
 
 ### Google Cloud setup
 
-- **Project**: Youtube Project 9869 (existing GCP project)
+- **Project**: Safe Place (existing GCP project)
 - **Client ID**: `805871064081-6uh6ghboi12sd4p5vn26cmalfh48lgaj.apps.googleusercontent.com`
 - **Authorized JS origins**: `http://localhost:3001`, `http://127.0.0.1:3001`, `https://dat5ngon.github.io`
 - **OAuth consent screen**: Testing mode. Test user: `dat5ngon@gmail.com`
