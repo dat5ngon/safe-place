@@ -1,356 +1,201 @@
-// Safe Place - Encrypted File Storage on GitHub
-// All encryption happens client-side using AES-256-GCM via Web Crypto API
+// Safe Place - File Storage on Google Drive
+// Supports folder navigation and a reusable API for other apps
 
-const UPLOADS_PATH = 'uploads';
-const SALT = new TextEncoder().encode('safe-place-v1');
+const CLIENT_ID = '805871064081-6uh6ghboi12sd4p5vn26cmalfh48lgaj.apps.googleusercontent.com';
+const SCOPES = 'https://www.googleapis.com/auth/drive.file';
+const ROOT_FOLDER_NAME = 'SafePlace';
 
 // ── State ──
 let state = {
-    passkey: null,
-    cryptoKey: null,
-    token: null,
-    repo: null,
-    user: null,
-    currentPath: UPLOADS_PATH,
+    accessToken: null,
+    rootFolderId: null,
+    currentFolderId: null,
+    folderPath: [],       // [{id, name}, ...] breadcrumb trail
+    tokenClient: null,
+    userEmail: null,
 };
 
-// ── DOM refs ──
 const $ = (id) => document.getElementById(id);
 
-// ── Crypto helpers ──
+// ══════════════════════════════════════════════════════════
+// SafePlace Storage API -- reusable by other apps
+// ══════════════════════════════════════════════════════════
 
-async function deriveKey(passkey) {
-    const keyMaterial = await crypto.subtle.importKey(
-        'raw',
-        new TextEncoder().encode(passkey),
-        'PBKDF2',
-        false,
-        ['deriveKey']
-    );
-    return crypto.subtle.deriveKey(
-        { name: 'PBKDF2', salt: SALT, iterations: 100000, hash: 'SHA-256' },
-        keyMaterial,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['encrypt', 'decrypt']
-    );
-}
-
-async function encryptData(data, key) {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const encrypted = await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv },
-        key,
-        data
-    );
-    // Prepend IV to ciphertext
-    const result = new Uint8Array(iv.length + encrypted.byteLength);
-    result.set(iv);
-    result.set(new Uint8Array(encrypted), iv.length);
-    return result;
-}
-
-async function decryptData(data, key) {
-    const iv = data.slice(0, 12);
-    const ciphertext = data.slice(12);
-    return crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv },
-        key,
-        ciphertext
-    );
-}
-
-// ── Passkey verification ──
-// We store a known encrypted marker in localStorage to verify the passkey
-
-const MARKER_KEY = 'safe-place-marker';
-const MARKER_TEXT = 'safe-place-unlocked';
-
-async function setPasskeyMarker(key) {
-    const encrypted = await encryptData(new TextEncoder().encode(MARKER_TEXT), key);
-    localStorage.setItem(MARKER_KEY, arrayToBase64(encrypted));
-}
-
-async function verifyPasskey(key) {
-    const stored = localStorage.getItem(MARKER_KEY);
-    if (!stored) return null; // First time -- no marker yet
-    try {
-        const data = base64ToArray(stored);
-        const decrypted = await decryptData(data, key);
-        const text = new TextDecoder().decode(decrypted);
-        return text === MARKER_TEXT;
-    } catch {
-        return false;
-    }
-}
-
-// ── Base64 helpers ──
-
-function arrayToBase64(arr) {
-    let binary = '';
-    for (let i = 0; i < arr.length; i++) {
-        binary += String.fromCharCode(arr[i]);
-    }
-    return btoa(binary);
-}
-
-function base64ToArray(b64) {
-    const binary = atob(b64);
-    const arr = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-        arr[i] = binary.charCodeAt(i);
-    }
-    return arr;
-}
-
-// ── GitHub API ──
-
-async function ghApi(path, options = {}) {
-    const url = path.startsWith('http') ? path : `https://api.github.com${path}`;
-    const res = await fetch(url, {
-        ...options,
-        headers: {
-            'Accept': 'application/vnd.github.v3+json',
-            ...(state.token ? { 'Authorization': `token ${state.token}` } : {}),
-            ...options.headers,
-        },
-    });
-    if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.message || `GitHub API error: ${res.status}`);
-    }
-    return res.json();
-}
-
-async function getUser() {
-    return ghApi('/user');
-}
-
-async function listFiles(path) {
-    try {
-        return await ghApi(`/repos/${state.repo}/contents/${path}`);
-    } catch {
-        return [];
-    }
-}
-
-async function uploadFile(path, content, message) {
-    // Check if file exists (to get sha for update)
-    let sha;
-    try {
-        const existing = await ghApi(`/repos/${state.repo}/contents/${path}`);
-        sha = existing.sha;
-    } catch {
-        // File doesn't exist yet
+class SafePlaceStorage {
+    constructor(accessToken, rootFolderId) {
+        this.accessToken = accessToken;
+        this.rootFolderId = rootFolderId;
     }
 
-    const body = {
-        message,
-        content: arrayToBase64(content),
-    };
-    if (sha) body.sha = sha;
-
-    return ghApi(`/repos/${state.repo}/contents/${path}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    });
-}
-
-async function deleteFile(path, sha) {
-    return ghApi(`/repos/${state.repo}/contents/${path}`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            message: `Delete ${path.split('/').pop()}`,
-            sha,
-        }),
-    });
-}
-
-async function downloadFile(url) {
-    const res = await fetch(url, {
-        headers: state.token ? { 'Authorization': `token ${state.token}` } : {},
-    });
-    if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-    return new Uint8Array(await res.arrayBuffer());
-}
-
-// ── File size formatting ──
-
-function formatSize(bytes) {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
-}
-
-// ── File type icons ──
-
-function getFileIcon(name) {
-    const ext = name.split('.').pop().toLowerCase();
-    const icons = {
-        pdf: '📄', doc: '📝', docx: '📝', txt: '📝',
-        jpg: '🖼️', jpeg: '🖼️', png: '🖼️', gif: '🖼️', svg: '🖼️', webp: '🖼️',
-        mp3: '🎵', wav: '🎵', flac: '🎵', ogg: '🎵',
-        mp4: '🎬', avi: '🎬', mkv: '🎬', mov: '🎬',
-        zip: '📦', rar: '📦', '7z': '📦', tar: '📦', gz: '📦',
-        js: '💻', ts: '💻', py: '💻', java: '💻', cpp: '💻', c: '💻',
-        html: '🌐', css: '🎨', json: '📋', xml: '📋',
-        exe: '⚙️', msi: '⚙️', bat: '⚙️', sh: '⚙️',
-    };
-    return icons[ext] || '📎';
-}
-
-// ── UI Updates ──
-
-function showApp() {
-    $('lock-screen').style.display = 'none';
-    $('app').style.display = 'block';
-}
-
-function showLockScreen() {
-    $('lock-screen').style.display = 'flex';
-    $('app').style.display = 'none';
-    $('passkey-input').value = '';
-    $('passkey-input').focus();
-}
-
-function updateAuthUI() {
-    if (state.token && state.user) {
-        $('auth-section').style.display = 'none';
-        $('connected-section').style.display = 'block';
-        $('upload-section').style.display = 'block';
-        $('connected-user').textContent = `✅ Connected as ${state.user.login} to ${state.repo}`;
-    } else {
-        $('auth-section').style.display = 'block';
-        $('connected-section').style.display = 'none';
-        $('upload-section').style.display = 'none';
+    async _api(path, options = {}) {
+        const url = path.startsWith('http') ? path : `https://www.googleapis.com/drive/v3${path}`;
+        const res = await fetch(url, {
+            ...options,
+            headers: {
+                'Authorization': `Bearer ${this.accessToken}`,
+                ...options.headers,
+            },
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error?.message || `Drive API error: ${res.status}`);
+        }
+        return res;
     }
-}
 
-function renderBreadcrumb() {
-    const parts = state.currentPath.split('/');
-    const bc = $('path-breadcrumb');
-    bc.innerHTML = '';
+    // Find a subfolder by name inside a parent, or create it
+    async getOrCreateFolder(name, parentId) {
+        parentId = parentId || this.rootFolderId;
+        const query = `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+        const res = await this._api(`/files?q=${encodeURIComponent(query)}&fields=files(id,name)`);
+        const data = await res.json();
 
-    parts.forEach((part, i) => {
-        if (i > 0) {
-            const sep = document.createElement('span');
-            sep.textContent = ' / ';
-            bc.appendChild(sep);
+        if (data.files && data.files.length > 0) {
+            return data.files[0];
         }
 
-        if (i < parts.length - 1) {
-            const link = document.createElement('a');
-            link.textContent = part;
-            link.onclick = () => {
-                state.currentPath = parts.slice(0, i + 1).join('/');
-                refreshFiles();
-            };
-            bc.appendChild(link);
-        } else {
-            const current = document.createElement('span');
-            current.textContent = part;
-            current.style.color = 'var(--text)';
-            bc.appendChild(current);
-        }
-    });
-}
+        const createRes = await this._api('/files', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                name,
+                mimeType: 'application/vnd.google-apps.folder',
+                parents: [parentId],
+            }),
+        });
+        return createRes.json();
+    }
 
-async function refreshFiles() {
-    const list = $('file-list');
-    list.innerHTML = '<div class="empty-state"><div class="spinner"></div> Loading...</div>';
-    renderBreadcrumb();
+    // List files and folders in a folder
+    async listFiles(folderId) {
+        folderId = folderId || this.rootFolderId;
+        const query = `'${folderId}' in parents and trashed=false`;
+        const res = await this._api(`/files?q=${encodeURIComponent(query)}&fields=files(id,name,size,modifiedTime,mimeType)&orderBy=folder,name&pageSize=100`);
+        const data = await res.json();
+        return data.files || [];
+    }
 
-    try {
-        const files = await listFiles(state.currentPath);
+    // Upload a file to a folder
+    async uploadFile(file, folderId) {
+        folderId = folderId || this.rootFolderId;
+        const metadata = {
+            name: file.name,
+            parents: [folderId],
+        };
 
-        if (!Array.isArray(files) || files.length === 0) {
-            list.innerHTML = '<p class="empty-state">No files yet. Upload something!</p>';
-            return;
-        }
+        const form = new FormData();
+        form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+        form.append('file', file);
 
-        // Sort: folders first, then files alphabetically
-        files.sort((a, b) => {
-            if (a.type === 'dir' && b.type !== 'dir') return -1;
-            if (a.type !== 'dir' && b.type === 'dir') return 1;
-            return a.name.localeCompare(b.name);
+        const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,size,modifiedTime,mimeType', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${this.accessToken}` },
+            body: form,
         });
 
-        list.innerHTML = '';
-
-        // Add "go up" if not at root uploads path
-        if (state.currentPath !== UPLOADS_PATH) {
-            const upItem = document.createElement('div');
-            upItem.className = 'file-item';
-            upItem.innerHTML = `
-                <span class="icon">⬆️</span>
-                <div class="info"><div class="name">..</div></div>
-            `;
-            upItem.onclick = () => {
-                const parts = state.currentPath.split('/');
-                parts.pop();
-                state.currentPath = parts.join('/');
-                refreshFiles();
-            };
-            list.appendChild(upItem);
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error?.message || `Upload failed: ${res.status}`);
         }
-
-        for (const file of files) {
-            // Skip non-encrypted metadata files
-            const item = document.createElement('div');
-            item.className = 'file-item';
-
-            if (file.type === 'dir') {
-                item.innerHTML = `
-                    <span class="icon">📁</span>
-                    <div class="info">
-                        <div class="name">${escapeHtml(file.name)}</div>
-                    </div>
-                `;
-                item.onclick = () => {
-                    state.currentPath = file.path;
-                    refreshFiles();
-                };
-            } else {
-                // Encrypted files have .enc extension; display original name
-                const displayName = file.name.endsWith('.enc')
-                    ? file.name.slice(0, -4)
-                    : file.name;
-
-                item.innerHTML = `
-                    <span class="icon">${getFileIcon(displayName)}</span>
-                    <div class="info">
-                        <div class="name">${escapeHtml(displayName)}</div>
-                        <div class="meta">${formatSize(file.size)}</div>
-                    </div>
-                    <div class="actions">
-                        <button class="action-btn download" title="Download & decrypt">⬇️</button>
-                        ${state.token ? `<button class="action-btn delete" title="Delete">🗑️</button>` : ''}
-                    </div>
-                `;
-
-                const downloadBtn = item.querySelector('.download');
-                downloadBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    handleDownload(file, displayName);
-                };
-
-                const deleteBtn = item.querySelector('.delete');
-                if (deleteBtn) {
-                    deleteBtn.onclick = (e) => {
-                        e.stopPropagation();
-                        handleDelete(file, displayName);
-                    };
-                }
-            }
-
-            list.appendChild(item);
-        }
-    } catch (err) {
-        list.innerHTML = `<p class="empty-state">Error loading files: ${escapeHtml(err.message)}</p>`;
+        return res.json();
     }
+
+    // Upload raw data (for other apps exporting JSON, etc.)
+    async uploadData(name, data, mimeType, folderId) {
+        folderId = folderId || this.rootFolderId;
+        const metadata = {
+            name,
+            parents: [folderId],
+        };
+
+        const form = new FormData();
+        form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+        form.append('file', new Blob([data], { type: mimeType }));
+
+        const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,size,modifiedTime,mimeType', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${this.accessToken}` },
+            body: form,
+        });
+
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error?.message || `Upload failed: ${res.status}`);
+        }
+        return res.json();
+    }
+
+    // Download a file as blob
+    async downloadFile(fileId) {
+        const res = await this._api(`/files/${fileId}?alt=media`);
+        return res.blob();
+    }
+
+    // Download a file as text
+    async downloadText(fileId) {
+        const res = await this._api(`/files/${fileId}?alt=media`);
+        return res.text();
+    }
+
+    // Download a file as JSON
+    async downloadJSON(fileId) {
+        const res = await this._api(`/files/${fileId}?alt=media`);
+        return res.json();
+    }
+
+    // Delete a file or folder
+    async deleteFile(fileId) {
+        await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${this.accessToken}` },
+        });
+    }
+
+    // Find a file by name in a folder
+    async findFile(name, folderId) {
+        folderId = folderId || this.rootFolderId;
+        const query = `name='${name}' and '${folderId}' in parents and trashed=false`;
+        const res = await this._api(`/files?q=${encodeURIComponent(query)}&fields=files(id,name,size,modifiedTime,mimeType)`);
+        const data = await res.json();
+        return data.files && data.files.length > 0 ? data.files[0] : null;
+    }
+
+    // Get an app-specific folder (creates if needed)
+    async getAppFolder(appName) {
+        const folder = await this.getOrCreateFolder(appName, this.rootFolderId);
+        return folder;
+    }
+}
+
+// Make it available globally for other apps
+window.SafePlaceStorage = SafePlaceStorage;
+
+// ── Helpers ──
+
+function formatSize(bytes) {
+    if (!bytes || bytes === 0) return '--';
+    const num = parseInt(bytes, 10);
+    if (isNaN(num)) return '--';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(num) / Math.log(1024));
+    return (num / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+}
+
+function getFileIcon(name, mimeType) {
+    if (mimeType === 'application/vnd.google-apps.folder') return '📁';
+    const ext = name.split('.').pop().toLowerCase();
+    const icons = {
+        pdf: '📄', doc: '📝', docx: '📝', txt: '📝', md: '📝',
+        jpg: '🖼️', jpeg: '🖼️', png: '🖼️', gif: '🖼️', svg: '🖼️', webp: '🖼️',
+        mp3: '🎵', wav: '🎵', flac: '🎵', ogg: '🎵', m4a: '🎵',
+        mp4: '🎬', avi: '🎬', mkv: '🎬', mov: '🎬', webm: '🎬',
+        zip: '📦', rar: '📦', '7z': '📦', tar: '📦', gz: '📦',
+        js: '💻', ts: '💻', py: '💻', java: '💻', cpp: '💻', c: '💻',
+        html: '🌐', css: '🎨', json: '📋', xml: '📋', csv: '📋',
+        exe: '⚙️', msi: '⚙️', bat: '⚙️', sh: '⚙️',
+        xls: '📊', xlsx: '📊', ppt: '📊', pptx: '📊',
+    };
+    return icons[ext] || '📎';
 }
 
 function escapeHtml(str) {
@@ -359,136 +204,214 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
-// ── Handlers ──
+function formatDate(dateStr) {
+    if (!dateStr) return '';
+    const d = new Date(dateStr);
+    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
 
-async function handleUnlock() {
-    const passkey = $('passkey-input').value.trim();
-    if (!passkey) {
-        $('lock-error').textContent = 'Please enter a passkey';
-        return;
+function isFolder(file) {
+    return file.mimeType === 'application/vnd.google-apps.folder';
+}
+
+// ── UI ──
+
+let storage = null;
+
+function showApp() {
+    $('login-screen').style.display = 'none';
+    $('app').style.display = 'block';
+}
+
+function showLogin() {
+    $('login-screen').style.display = 'flex';
+    $('app').style.display = 'none';
+}
+
+function renderBreadcrumb() {
+    const bc = $('breadcrumb');
+    bc.innerHTML = '';
+
+    // Root
+    const rootLink = document.createElement('a');
+    rootLink.textContent = 'SafePlace';
+    rootLink.onclick = () => navigateTo(state.rootFolderId, []);
+    bc.appendChild(rootLink);
+
+    for (let i = 0; i < state.folderPath.length; i++) {
+        const sep = document.createElement('span');
+        sep.textContent = ' / ';
+        bc.appendChild(sep);
+
+        const item = state.folderPath[i];
+        if (i < state.folderPath.length - 1) {
+            const link = document.createElement('a');
+            link.textContent = item.name;
+            link.onclick = () => navigateTo(item.id, state.folderPath.slice(0, i + 1));
+            bc.appendChild(link);
+        } else {
+            const current = document.createElement('span');
+            current.textContent = item.name;
+            current.className = 'breadcrumb-current';
+            bc.appendChild(current);
+        }
     }
+}
+
+function navigateTo(folderId, path) {
+    state.currentFolderId = folderId;
+    state.folderPath = path;
+    renderBreadcrumb();
+    refreshFiles();
+}
+
+async function refreshFiles() {
+    const list = $('file-list');
+    list.innerHTML = '<div class="empty-state"><div class="spinner"></div> Loading...</div>';
 
     try {
-        const key = await deriveKey(passkey);
-        const verified = await verifyPasskey(key);
+        const files = await storage.listFiles(state.currentFolderId);
 
-        if (verified === false) {
-            $('lock-error').textContent = 'Wrong passkey. Try again.';
-            $('passkey-input').value = '';
-            $('passkey-input').focus();
+        if (files.length === 0) {
+            list.innerHTML = '<p class="empty-state">Empty folder. Upload files or create a subfolder.</p>';
             return;
         }
 
-        if (verified === null) {
-            // First time -- set the marker
-            await setPasskeyMarker(key);
-        }
+        // Sort: folders first, then files
+        files.sort((a, b) => {
+            const aFolder = isFolder(a) ? 0 : 1;
+            const bFolder = isFolder(b) ? 0 : 1;
+            if (aFolder !== bFolder) return aFolder - bFolder;
+            return a.name.localeCompare(b.name);
+        });
 
-        state.passkey = passkey;
-        state.cryptoKey = key;
+        list.innerHTML = '';
 
-        // Restore saved GitHub connection
-        const savedToken = localStorage.getItem('safe-place-token');
-        const savedRepo = localStorage.getItem('safe-place-repo');
-        if (savedToken && savedRepo) {
-            state.token = savedToken;
-            state.repo = savedRepo;
-            try {
-                state.user = await getUser();
-            } catch {
-                // Token expired or invalid
-                state.token = null;
-                state.repo = null;
-                localStorage.removeItem('safe-place-token');
-                localStorage.removeItem('safe-place-repo');
+        for (const file of files) {
+            const item = document.createElement('div');
+            item.className = 'file-item';
+
+            if (isFolder(file)) {
+                item.innerHTML = `
+                    <span class="icon">📁</span>
+                    <div class="info">
+                        <div class="name">${escapeHtml(file.name)}</div>
+                        <div class="meta">Folder</div>
+                    </div>
+                    <div class="actions">
+                        <button class="action-btn delete" title="Delete folder">🗑️</button>
+                    </div>
+                `;
+                item.onclick = () => {
+                    const newPath = [...state.folderPath, { id: file.id, name: file.name }];
+                    navigateTo(file.id, newPath);
+                };
+            } else {
+                item.innerHTML = `
+                    <span class="icon">${getFileIcon(file.name, file.mimeType)}</span>
+                    <div class="info">
+                        <div class="name">${escapeHtml(file.name)}</div>
+                        <div class="meta">${formatSize(file.size)} · ${formatDate(file.modifiedTime)}</div>
+                    </div>
+                    <div class="actions">
+                        <button class="action-btn download" title="Download">⬇️</button>
+                        <button class="action-btn delete" title="Delete">🗑️</button>
+                    </div>
+                `;
+
+                item.querySelector('.download').onclick = (e) => {
+                    e.stopPropagation();
+                    handleDownload(file.id, file.name);
+                };
             }
-        }
 
-        showApp();
-        updateAuthUI();
+            const deleteBtn = item.querySelector('.delete');
+            deleteBtn.onclick = (e) => {
+                e.stopPropagation();
+                handleDelete(file.id, file.name, isFolder(file));
+            };
 
-        if (state.token) {
-            refreshFiles();
+            list.appendChild(item);
         }
     } catch (err) {
-        $('lock-error').textContent = 'Error: ' + err.message;
+        list.innerHTML = `<p class="empty-state">Error: ${escapeHtml(err.message)}</p>`;
     }
 }
 
-async function handleConnect() {
-    const token = $('token-input').value.trim();
-    const repo = $('repo-input').value.trim();
-    const status = $('auth-status');
+// ── Google Auth ──
 
-    if (!token || !repo) {
-        status.textContent = 'Please fill in both fields';
-        status.className = 'status error';
+function initGoogleAuth() {
+    state.tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: SCOPES,
+        callback: async (response) => {
+            if (response.error) {
+                $('login-status').textContent = 'Sign-in failed: ' + response.error;
+                $('login-status').className = 'status error';
+                return;
+            }
+            state.accessToken = response.access_token;
+
+            try {
+                // Get user info
+                const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+                    headers: { 'Authorization': `Bearer ${state.accessToken}` },
+                });
+                const user = await userRes.json();
+                state.userEmail = user.email;
+                $('user-email').textContent = user.email;
+
+                // Initialize storage
+                storage = new SafePlaceStorage(state.accessToken, null);
+
+                // Find or create root SafePlace folder
+                const rootFolder = await storage.getOrCreateFolder(ROOT_FOLDER_NAME, 'root');
+                state.rootFolderId = rootFolder.id;
+                state.currentFolderId = rootFolder.id;
+                storage.rootFolderId = rootFolder.id;
+
+                // Expose storage globally for other apps
+                window.safePlace = storage;
+
+                showApp();
+                renderBreadcrumb();
+                refreshFiles();
+            } catch (err) {
+                $('login-status').textContent = 'Error: ' + err.message;
+                $('login-status').className = 'status error';
+                state.accessToken = null;
+            }
+        },
+    });
+}
+
+function handleSignIn() {
+    if (!state.tokenClient) {
+        $('login-status').textContent = 'Google API not loaded yet. Please wait...';
+        $('login-status').className = 'status error';
         return;
     }
+    state.tokenClient.requestAccessToken({ prompt: 'consent' });
+}
 
-    if (!repo.includes('/')) {
-        status.textContent = 'Repo format: username/repo-name';
-        status.className = 'status error';
-        return;
+function handleSignOut() {
+    if (state.accessToken) {
+        google.accounts.oauth2.revoke(state.accessToken);
     }
-
-    status.innerHTML = '<span class="spinner"></span> Connecting...';
-    status.className = 'status';
-
-    try {
-        state.token = token;
-        state.repo = repo;
-        state.user = await getUser();
-
-        // Ensure uploads folder exists
-        try {
-            await listFiles(UPLOADS_PATH);
-        } catch {
-            // Create uploads folder with a .gitkeep
-            await uploadFile(
-                `${UPLOADS_PATH}/.gitkeep`,
-                new TextEncoder().encode(''),
-                'Initialize uploads folder'
-            );
-        }
-
-        // Save connection (encrypted token would be better, but localStorage is per-origin)
-        localStorage.setItem('safe-place-token', token);
-        localStorage.setItem('safe-place-repo', repo);
-
-        $('token-input').value = '';
-        updateAuthUI();
-        refreshFiles();
-    } catch (err) {
-        status.textContent = 'Connection failed: ' + err.message;
-        status.className = 'status error';
-        state.token = null;
-        state.repo = null;
-        state.user = null;
-    }
+    state.accessToken = null;
+    state.rootFolderId = null;
+    state.currentFolderId = null;
+    state.folderPath = [];
+    state.userEmail = null;
+    storage = null;
+    window.safePlace = null;
+    showLogin();
 }
 
-function handleDisconnect() {
-    state.token = null;
-    state.repo = null;
-    state.user = null;
-    localStorage.removeItem('safe-place-token');
-    localStorage.removeItem('safe-place-repo');
-    updateAuthUI();
-    $('file-list').innerHTML = '<p class="empty-state">Connect to GitHub to browse files</p>';
-}
-
-function handleLock() {
-    state.passkey = null;
-    state.cryptoKey = null;
-    state.token = null;
-    state.repo = null;
-    state.user = null;
-    showLockScreen();
-}
+// ── Handlers ──
 
 async function handleUpload(files) {
-    if (!state.token || !state.cryptoKey) return;
+    if (!storage) return;
 
     const progress = $('upload-progress');
 
@@ -502,17 +425,7 @@ async function handleUpload(files) {
         progress.appendChild(itemEl);
 
         try {
-            // Read file
-            const buffer = await file.arrayBuffer();
-            const data = new Uint8Array(buffer);
-
-            // Encrypt
-            const encrypted = await encryptData(data, state.cryptoKey);
-
-            // Upload to GitHub
-            const filePath = `${state.currentPath}/${file.name}.enc`;
-            await uploadFile(filePath, encrypted, `Upload ${file.name}`);
-
+            await storage.uploadFile(file, state.currentFolderId);
             itemEl.querySelector('.status-icon').innerHTML = '✅';
             itemEl.querySelector('.status-icon').className = 'status-icon done';
         } catch (err) {
@@ -522,49 +435,36 @@ async function handleUpload(files) {
         }
     }
 
-    // Refresh file list after all uploads
     refreshFiles();
 
-    // Clear progress after a delay
     setTimeout(() => {
         progress.innerHTML = '';
     }, 3000);
 }
 
-async function handleDownload(file, displayName) {
-    if (!state.cryptoKey) return;
-
+async function handleDownload(fileId, fileName) {
     try {
-        // Download encrypted content
-        const encryptedB64 = await ghApi(`/repos/${state.repo}/contents/${file.path}`);
-        const encrypted = base64ToArray(encryptedB64.content.replace(/\n/g, ''));
-
-        // Decrypt
-        const decrypted = await decryptData(encrypted, state.cryptoKey);
-
-        // Trigger download
-        const blob = new Blob([decrypted]);
+        const blob = await storage.downloadFile(fileId);
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = displayName;
+        a.download = fileName;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
     } catch (err) {
-        alert('Download failed: ' + err.message + '\n\nMake sure you are using the correct passkey.');
+        alert('Download failed: ' + err.message);
     }
 }
 
-async function handleDelete(file, displayName) {
-    // Show confirm dialog
+async function handleDelete(fileId, fileName, folder) {
     const overlay = document.createElement('div');
     overlay.className = 'overlay';
     overlay.innerHTML = `
         <div class="confirm-dialog">
-            <h3>Delete file?</h3>
-            <p>Are you sure you want to delete <strong>${escapeHtml(displayName)}</strong>?</p>
+            <h3>Delete ${folder ? 'folder' : 'file'}?</h3>
+            <p>Are you sure you want to delete <strong>${escapeHtml(fileName)}</strong>${folder ? ' and all its contents' : ''}?</p>
             <div class="btn-group">
                 <button class="btn btn-small cancel-btn">Cancel</button>
                 <button class="btn btn-danger confirm-btn">Delete</button>
@@ -581,7 +481,7 @@ async function handleDelete(file, displayName) {
         };
         overlay.querySelector('.confirm-btn').onclick = async () => {
             try {
-                await deleteFile(file.path, file.sha);
+                await storage.deleteFile(fileId);
                 document.body.removeChild(overlay);
                 refreshFiles();
             } catch (err) {
@@ -599,26 +499,35 @@ async function handleDelete(file, displayName) {
     });
 }
 
-// ── Event listeners ──
+async function handleNewFolder() {
+    const name = prompt('Folder name:');
+    if (!name || !name.trim()) return;
+
+    try {
+        await storage.getOrCreateFolder(name.trim(), state.currentFolderId);
+        refreshFiles();
+    } catch (err) {
+        alert('Failed to create folder: ' + err.message);
+    }
+}
+
+// ── Init ──
+
+function waitForGoogleApi() {
+    if (typeof google !== 'undefined' && google.accounts && google.accounts.oauth2) {
+        initGoogleAuth();
+    } else {
+        setTimeout(waitForGoogleApi, 200);
+    }
+}
 
 document.addEventListener('DOMContentLoaded', () => {
-    // Passkey unlock
-    $('unlock-btn').addEventListener('click', handleUnlock);
-    $('passkey-input').addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') handleUnlock();
-    });
-
-    // Lock button
-    $('lock-btn').addEventListener('click', handleLock);
-
-    // GitHub auth
-    $('connect-btn').addEventListener('click', handleConnect);
-    $('disconnect-btn').addEventListener('click', handleDisconnect);
-
-    // Refresh
+    $('signin-btn').addEventListener('click', handleSignIn);
+    $('signout-btn').addEventListener('click', handleSignOut);
     $('refresh-btn').addEventListener('click', refreshFiles);
+    $('new-folder-btn').addEventListener('click', handleNewFolder);
 
-    // File upload -- drop zone
+    // File upload
     const dropZone = $('drop-zone');
     const fileInput = $('file-input');
 
@@ -648,12 +557,5 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Restore repo input from saved value
-    const savedRepo = localStorage.getItem('safe-place-repo');
-    if (savedRepo) {
-        $('repo-input').value = savedRepo;
-    }
-
-    // Focus passkey input
-    $('passkey-input').focus();
+    waitForGoogleApi();
 });
