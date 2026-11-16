@@ -511,6 +511,78 @@ async function handleNewFolder() {
     }
 }
 
+// ── Cross-App postMessage API ──
+// Other apps on the same origin (e.g. music-player) can embed safe-place
+// in a hidden iframe and use postMessage to save/load data.
+//
+// Request format:  { type: 'safeplace-request', id: <string>, action: <string>, ... }
+// Response format: { type: 'safeplace-response', id: <string>, ok: <bool>, ... }
+//
+// Actions:
+//   ping          -- check if user is authenticated. Returns { ok, authenticated }
+//   save          -- save JSON data. Params: { app, filename, data }
+//   load          -- load JSON data. Params: { app, filename }
+
+const ALLOWED_ORIGIN = location.origin; // same-origin only
+
+window.addEventListener('message', async (event) => {
+    if (event.origin !== ALLOWED_ORIGIN) return;
+    const msg = event.data;
+    if (!msg || msg.type !== 'safeplace-request' || !msg.id) return;
+
+    const reply = (payload) => {
+        event.source.postMessage({ type: 'safeplace-response', id: msg.id, ...payload }, event.origin);
+    };
+
+    if (!storage) {
+        reply({ ok: false, error: 'Not authenticated. Please sign in to Safe Place first.' });
+        return;
+    }
+
+    try {
+        switch (msg.action) {
+            case 'ping':
+                reply({ ok: true, authenticated: true });
+                break;
+
+            case 'save': {
+                if (!msg.app || !msg.filename || msg.data === undefined) {
+                    reply({ ok: false, error: 'Missing app, filename, or data' });
+                    return;
+                }
+                const folder = await storage.getAppFolder(msg.app);
+                // Delete existing file to avoid duplicates
+                const existing = await storage.findFile(msg.filename, folder.id);
+                if (existing) await storage.deleteFile(existing.id);
+                await storage.uploadData(msg.filename, JSON.stringify(msg.data, null, 2), 'application/json', folder.id);
+                reply({ ok: true });
+                break;
+            }
+
+            case 'load': {
+                if (!msg.app || !msg.filename) {
+                    reply({ ok: false, error: 'Missing app or filename' });
+                    return;
+                }
+                const folder = await storage.getAppFolder(msg.app);
+                const file = await storage.findFile(msg.filename, folder.id);
+                if (!file) {
+                    reply({ ok: true, data: null });
+                    return;
+                }
+                const data = await storage.downloadJSON(file.id);
+                reply({ ok: true, data });
+                break;
+            }
+
+            default:
+                reply({ ok: false, error: 'Unknown action: ' + msg.action });
+        }
+    } catch (err) {
+        reply({ ok: false, error: err.message });
+    }
+});
+
 // ── Init ──
 
 function waitForGoogleApi() {
