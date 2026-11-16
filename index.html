@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Safe Place - Encrypted File Storage</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+</head>
+<body>
+    <!-- Passkey Gate -->
+    <div id="lock-screen" class="lock-screen">
+        <div class="lock-card">
+            <div class="lock-icon">🔒</div>
+            <h1>Safe Place</h1>
+            <p>Enter your passkey to access files</p>
+            <div class="lock-form">
+                <input type="password" id="passkey-input" placeholder="Enter passkey" autofocus>
+                <button id="unlock-btn" class="btn btn-primary">Unlock</button>
+            </div>
+            <div id="lock-error" class="error-msg"></div>
+        </div>
+    </div>
+
+    <!-- Main App (hidden until unlocked) -->
+    <div id="app" class="container" style="display:none;">
+        <header>
+            <div class="header-row">
+                <h1>🔓 Safe Place</h1>
+                <button id="lock-btn" class="btn btn-small btn-danger">Lock</button>
+            </div>
+            <p class="subtitle">Encrypted file storage on GitHub</p>
+        </header>
+
+        <!-- GitHub Auth Section -->
+        <div id="auth-section" class="card">
+            <h2>🔑 Connect to GitHub</h2>
+            <p>Enter your GitHub Personal Access Token to enable uploads.<br>
+               <small>Need a token? <a href="https://github.com/settings/tokens/new?scopes=repo&description=safe-place" target="_blank">Create one here</a> (select "repo" scope)</small>
+            </p>
+            <div class="auth-form">
+                <input type="password" id="token-input" placeholder="ghp_xxxxxxxxxxxx">
+                <input type="text" id="repo-input" placeholder="username/safe-place">
+                <button id="connect-btn" class="btn btn-primary">Connect</button>
+            </div>
+            <div id="auth-status" class="status"></div>
+        </div>
+
+        <!-- Connected Info -->
+        <div id="connected-section" class="card" style="display:none;">
+            <div class="connected-header">
+                <span id="connected-user">Connected</span>
+                <button id="disconnect-btn" class="btn btn-small btn-danger">Disconnect</button>
+            </div>
+        </div>
+
+        <!-- Upload Section -->
+        <div id="upload-section" class="card" style="display:none;">
+            <h2>📤 Upload Files</h2>
+            <div id="drop-zone" class="drop-zone">
+                <p>Drag & drop files here<br>or click to browse</p>
+                <input type="file" id="file-input" multiple hidden>
+            </div>
+            <div id="upload-progress" class="progress-list"></div>
+        </div>
+
+        <!-- File List Section -->
+        <div id="files-section" class="card">
+            <div class="files-header">
+                <h2>📁 Files</h2>
+                <button id="refresh-btn" class="btn btn-small">↻ Refresh</button>
+            </div>
+            <div id="path-breadcrumb" class="breadcrumb"></div>
+            <div id="file-list" class="file-list">
+                <p class="empty-state">Connect to GitHub to browse files</p>
+            </div>
+        </div>
+
+        <footer>
+            <p>Files are encrypted client-side before upload. Your passkey never leaves the browser.</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
