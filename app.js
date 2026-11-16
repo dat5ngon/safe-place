@@ -338,17 +338,15 @@ async function refreshFiles() {
     }
 }
 
-// ── Token persistence ──
-// Persist the OAuth access token so embedded iframes (music-player,
-// password-manager) can use it without requiring a separate sign-in.
+// ── Session persistence ──
+// Persist the access token + metadata so embedded iframes and page reloads
+// can reuse the session without requiring a new sign-in.
+// Tokens are valid for ~1 hour (Google's default).
 
 function saveSession(accessToken, expiresIn, rootFolderId, userEmail) {
     const expiresAt = Date.now() + (expiresIn || 3600) * 1000;
     localStorage.setItem('sp_session', JSON.stringify({
-        accessToken,
-        expiresAt,
-        rootFolderId,
-        userEmail,
+        accessToken, expiresAt, rootFolderId, userEmail,
     }));
 }
 
@@ -374,38 +372,23 @@ function clearSession() {
 }
 
 // Try to restore a saved session on page load (including iframe loads).
-// Validates the token is still accepted by Google before using it.
-async function tryRestoreSession() {
+// Uses the saved token directly without a validation API call.
+function tryRestoreSession() {
     const session = loadSession();
     if (!session) return false;
 
-    try {
-        // Validate the token is still valid by calling userinfo
-        const res = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-            headers: { 'Authorization': `Bearer ${session.accessToken}` },
-        });
-        if (!res.ok) {
-            clearSession();
-            return false;
-        }
+    state.accessToken = session.accessToken;
+    state.rootFolderId = session.rootFolderId;
+    state.currentFolderId = session.rootFolderId;
+    state.userEmail = session.userEmail;
 
-        state.accessToken = session.accessToken;
-        state.rootFolderId = session.rootFolderId;
-        state.currentFolderId = session.rootFolderId;
-        state.userEmail = session.userEmail;
+    storage = new SafePlaceStorage(state.accessToken, state.rootFolderId);
+    window.safePlace = storage;
 
-        storage = new SafePlaceStorage(state.accessToken, state.rootFolderId);
-        window.safePlace = storage;
+    const emailEl = $('user-email');
+    if (emailEl) emailEl.textContent = state.userEmail || '';
 
-        // Update UI if visible (not in iframe)
-        const emailEl = $('user-email');
-        if (emailEl) emailEl.textContent = state.userEmail || '';
-
-        return true;
-    } catch {
-        clearSession();
-        return false;
-    }
+    return true;
 }
 
 // ── Google Auth ──
@@ -464,7 +447,10 @@ function handleSignIn() {
         $('login-status').className = 'status error';
         return;
     }
-    state.tokenClient.requestAccessToken({ prompt: 'consent' });
+    // Use 'select_account' instead of 'consent' so returning users
+    // don't need to re-authorize -- just pick their account.
+    // This also avoids revoking the previous token.
+    state.tokenClient.requestAccessToken({ prompt: 'select_account' });
 }
 
 function handleSignOut() {
@@ -660,11 +646,16 @@ window.addEventListener('message', async (event) => {
 // ── Init ──
 
 function waitForGoogleApi() {
-    if (typeof google !== 'undefined' && google.accounts && google.accounts.oauth2) {
-        initGoogleAuth();
-    } else {
-        setTimeout(waitForGoogleApi, 200);
-    }
+    return new Promise((resolve) => {
+        function check() {
+            if (typeof google !== 'undefined' && google.accounts && google.accounts.oauth2) {
+                resolve();
+            } else {
+                setTimeout(check, 200);
+            }
+        }
+        check();
+    });
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -703,9 +694,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
-    // Try to restore a saved session (persisted token from a previous sign-in).
-    // This lets embedded iframes and page reloads skip the login screen.
-    const restored = await tryRestoreSession();
+    // Try to restore a saved session (token persisted from a previous sign-in).
+    // This lets page reloads and embedded iframes skip the login screen.
+    const restored = tryRestoreSession();
     if (restored) {
         showApp();
         renderBreadcrumb();
@@ -713,5 +704,5 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // Always init Google Auth so the sign-in button works if needed
-    waitForGoogleApi();
+    waitForGoogleApi().then(() => initGoogleAuth());
 });
