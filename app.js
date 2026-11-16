@@ -338,6 +338,76 @@ async function refreshFiles() {
     }
 }
 
+// ── Token persistence ──
+// Persist the OAuth access token so embedded iframes (music-player,
+// password-manager) can use it without requiring a separate sign-in.
+
+function saveSession(accessToken, expiresIn, rootFolderId, userEmail) {
+    const expiresAt = Date.now() + (expiresIn || 3600) * 1000;
+    localStorage.setItem('sp_session', JSON.stringify({
+        accessToken,
+        expiresAt,
+        rootFolderId,
+        userEmail,
+    }));
+}
+
+function loadSession() {
+    try {
+        const raw = localStorage.getItem('sp_session');
+        if (!raw) return null;
+        const session = JSON.parse(raw);
+        // Check if token has expired (with 60s buffer)
+        if (!session.accessToken || !session.expiresAt || Date.now() > session.expiresAt - 60000) {
+            localStorage.removeItem('sp_session');
+            return null;
+        }
+        return session;
+    } catch {
+        localStorage.removeItem('sp_session');
+        return null;
+    }
+}
+
+function clearSession() {
+    localStorage.removeItem('sp_session');
+}
+
+// Try to restore a saved session on page load (including iframe loads).
+// Validates the token is still accepted by Google before using it.
+async function tryRestoreSession() {
+    const session = loadSession();
+    if (!session) return false;
+
+    try {
+        // Validate the token is still valid by calling userinfo
+        const res = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+            headers: { 'Authorization': `Bearer ${session.accessToken}` },
+        });
+        if (!res.ok) {
+            clearSession();
+            return false;
+        }
+
+        state.accessToken = session.accessToken;
+        state.rootFolderId = session.rootFolderId;
+        state.currentFolderId = session.rootFolderId;
+        state.userEmail = session.userEmail;
+
+        storage = new SafePlaceStorage(state.accessToken, state.rootFolderId);
+        window.safePlace = storage;
+
+        // Update UI if visible (not in iframe)
+        const emailEl = $('user-email');
+        if (emailEl) emailEl.textContent = state.userEmail || '';
+
+        return true;
+    } catch {
+        clearSession();
+        return false;
+    }
+}
+
 // ── Google Auth ──
 
 function initGoogleAuth() {
@@ -369,6 +439,9 @@ function initGoogleAuth() {
                 state.rootFolderId = rootFolder.id;
                 state.currentFolderId = rootFolder.id;
                 storage.rootFolderId = rootFolder.id;
+
+                // Persist session so iframes and page reloads can reuse it
+                saveSession(state.accessToken, response.expires_in, state.rootFolderId, state.userEmail);
 
                 // Expose storage globally for other apps
                 window.safePlace = storage;
@@ -405,6 +478,7 @@ function handleSignOut() {
     state.userEmail = null;
     storage = null;
     window.safePlace = null;
+    clearSession();
     showLogin();
 }
 
@@ -593,7 +667,7 @@ function waitForGoogleApi() {
     }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     $('signin-btn').addEventListener('click', handleSignIn);
     $('signout-btn').addEventListener('click', handleSignOut);
     $('refresh-btn').addEventListener('click', refreshFiles);
@@ -629,5 +703,15 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // Try to restore a saved session (persisted token from a previous sign-in).
+    // This lets embedded iframes and page reloads skip the login screen.
+    const restored = await tryRestoreSession();
+    if (restored) {
+        showApp();
+        renderBreadcrumb();
+        refreshFiles();
+    }
+
+    // Always init Google Auth so the sign-in button works if needed
     waitForGoogleApi();
 });
